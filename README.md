@@ -1,25 +1,37 @@
 # thread_addiotin
 
-A small AMD ROCm/HIP program that has 100 GPU threads each allocate 1 MiB from the
-device heap, fill it with pseudo-random data, checksum it, wait 2 seconds, and hand
-the result back to the CPU, which floors each checksum into a 100-element `int`
-array and prints it.
+A small AMD ROCm/HIP program that launches 100 separately named kernels,
+`rocmtestkernel_0` through `rocmtestkernel_99`, one GPU thread each. Every kernel
+allocates 1 MiB from the device heap, fills it with pseudo-random data, checksums
+it, waits 2 seconds, and hands the result back to the CPU, which floors each
+checksum into a 100-element `int` array and prints it.
 
 ## What it does
 
 | Step | Requirement | Where it lives |
 | --- | --- | --- |
-| 1 | 100-element `int` array in `main` | `int checksums[kNumThreads]` in `main()` |
-| 2 | Spawn 100 GPU threads | `checksum_device_memory<<<1, 100>>>` |
-| 3 | 1 MiB per thread, filled and checksummed | device-side `malloc(1 MiB)`, filled by a per-thread generator, summed through a `volatile` pointer |
+| 1 | 100-element `int` array in `main` | `int checksums[kNumKernels]` in `main()` |
+| 2 | 100 GPU threads | 100 distinct kernels, `rocmtestkernel_<n><<<1, 1, 0, streams[n]>>>` |
+| 3 | 1 MiB per kernel, filled and checksummed | device-side `malloc(1 MiB)`, filled by a per-kernel generator, summed through a `volatile` pointer |
 | 4 | 2 second in-kernel delay after the checksum | `busy_wait()` on `wall_clock64()` before the store |
 | 5 | Checksum back to the CPU, floored into the array | `hipMemcpy` + `std::floor` |
 | 6 | CPU prints the array | `print_array()` after all 100 values arrive |
 
-Each thread seeds its own generator from `seed ^ (tid * 0x9e3779b9)`, so the 100
-buffers hold different data and the 100 checksums differ from one another.
-Passing `--uninitialized` skips the fill and checksums the device heap exactly as
-it was handed over, which is the original behaviour.
+The 100 kernels are real, separately named entry points, not one kernel launched
+100 times. They are generated from a single list of sequence numbers,
+`ROCM_TEST_KERNEL_SEQUENCE`, which also generates the 100 launch statements and
+the kernel count — so adding or removing a kernel means editing one line. You can
+see all 100 symbols in the binary:
+
+```bash
+nm -C build/thread_addition | grep rocmtestkernel_
+```
+
+Each kernel gets its own stream so they overlap; on the null stream the run would
+take 100 × 2 seconds. Each seeds its own generator from
+`seed ^ (sequence * 0x9e3779b9)`, so the 100 buffers hold different data and the
+100 checksums differ from one another. Passing `--uninitialized` skips the fill
+and checksums the device heap exactly as it was handed over.
 
 Source: [`src/thread_addition.hip`](src/thread_addition.hip). Design notes and the
 reasoning behind the tricky parts: [`docs/DESIGN.md`](docs/DESIGN.md).
@@ -82,28 +94,42 @@ Sample output:
 
 ```
 Device 0: AMD Instinct MI300X (gfx942)
-Threads: 100, per-thread allocation: 1024 KiB, delay: 2000 ms
+Kernels: 100 (rocmtestkernel_0 .. rocmtestkernel_99), 1 thread each
+Per-kernel allocation: 1024 KiB, delay: 2000 ms
 Memory: filled with random words, seed 0x5c3f1a02
 
-Checksums (floored) for 100 GPU threads:
+Checksums (floored) from 100 kernels:
   [  0..  9]     131020     131195     130946     131243     131077     130998     131164     131052     130901     131209
   ...
   [ 90.. 99]     131118     130972     131241     131006     131155     130889     131093     131207     130964     131130
 
-Kernel wall time: 2000.38 ms (expected >= 2000 ms)
+All 100 kernels completed in 2004.71 ms (delay is 2000 ms)
 ```
 
-The exit code is 0 when all 100 threads got their memory, and 1 if any
+The exit code is 0 when all 100 kernels got their memory, and 1 if any
 device-side `malloc` failed (those slots print `-1`).
+
+### About the run time
+
+The whole run should take a little over 2 seconds, not 200, because the kernels
+overlap. How well they overlap depends on `GPU_MAX_HW_QUEUES`: HIP multiplexes
+streams onto a small number of hardware queues (4 by default) and kernels sharing
+a queue run back to back. The program sets it to 16 before initializing the
+runtime unless you set it yourself, and warns if the total still comes out far
+above the delay:
+
+```bash
+GPU_MAX_HW_QUEUES=32 ./build/thread_addition   # overlap more aggressively
+```
 
 ### About the values
 
 The checksum is the sum of the 262,144 words in the buffer with each word
 normalized to `[0, 1)` — that is, the raw 64-bit sum divided by 2³². For
 uniformly random data the expected value is half the word count, so **checksums
-cluster around 131072**, drifting by a few hundred either way from thread to
-thread. That spread is the randomness; identical values across all 100 threads
-would mean the per-thread seeding is broken.
+cluster around 131072**, drifting by a few hundred either way from kernel to
+kernel. That spread is the randomness; identical values across all 100 kernels
+would mean the per-kernel seeding is broken.
 
 Use `--seed N` to make a run reproducible: the same seed gives the same 100
 checksums on the same GPU.
@@ -125,32 +151,45 @@ Command line:
 
 | Flag | Meaning |
 | --- | --- |
-| `--seed N` | Seed the per-thread generators; same seed, same checksums |
+| `--seed N` | Seed the per-kernel generators; same seed, same checksums |
 | `--uninitialized` | Skip the random fill and checksum the heap as-is |
+
+Environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `GPU_MAX_HW_QUEUES` | Hardware queues the 100 streams are spread across; the program defaults it to 16 |
+| `HIP_VISIBLE_DEVICES` | Pick the GPU, e.g. a headless one with no watchdog |
 
 Everything else is a constant at the top of `src/thread_addition.hip`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `kNumThreads` | 100 | GPU threads, and array elements |
-| `kBlockSize` | 100 | Threads per block (grid size follows) |
-| `kBytesPerThread` | 1 MiB | Device-heap allocation per thread |
+| `ROCM_TEST_KERNEL_SEQUENCE` | 0..99 | The kernel sequence numbers; definitions, launches and the count all come from this list |
+| `kNumKernels` | 100 | Counted from the list above; kernels, GPU threads and array elements |
+| `kBytesPerKernel` | 1 MiB | Device-heap allocation per kernel |
 | `kWordScale` | 2³² | Divisor that normalizes each word before summing |
 | `kDelayMilliseconds` | 2000 | In-kernel delay before publishing the result |
 | `kDeviceHeapBytes` | 200 MiB | `hipLimitMallocHeapSize`; must cover every live allocation plus allocator overhead |
+
+Adding kernel 100 means appending `X(100)` to `ROCM_TEST_KERNEL_SEQUENCE` and
+bumping `kExpectedKernels`; a `static_assert` fails if the two disagree.
 
 ## Troubleshooting
 
 - **All checksums are `0`** — expected with `--uninitialized` (see above). Drop
   the flag to fill the buffers with random data instead.
-- **All 100 checksums are identical** — the per-thread seeding is not varying;
-  check that the kernel is mixing `tid` into the generator state.
+- **All 100 checksums are identical** — the per-kernel seeding is not varying;
+  check that the kernel is mixing its sequence number into the generator state.
 - **All checksums are `-1`** — the device heap is too small or fragmented. Raise
-  `kDeviceHeapBytes`, or lower `kBytesPerThread`.
+  `kDeviceHeapBytes`, or lower `kBytesPerKernel`.
+- **The run takes ~50 seconds instead of ~2** — the kernels are serializing on a
+  handful of hardware queues. Raise `GPU_MAX_HW_QUEUES`; the program says so when
+  it detects this.
 - **`hipErrorUnsupportedLimit` from `hipDeviceSetLimit`** — the runtime is too old
   to resize the device heap. Upgrade ROCm, or set `HIP_MALLOC_HEAP_SIZE` in the
   environment instead.
-- **Kernel wall time is far from 2000 ms** — the GPU reported no wall clock rate
+- **Total time is well under 2000 ms** — the GPU reported no wall clock rate
   and the program fell back to the shader clock (it warns when this happens).
   The shader clock drifts with DVFS, so the delay becomes approximate.
 - **The GPU resets, or the run dies with `HSA_STATUS_ERROR` / a queue preemption

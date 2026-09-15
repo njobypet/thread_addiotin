@@ -2,22 +2,65 @@
 
 This document explains the non-obvious parts of `src/thread_addition.hip`. The
 requirements themselves are simple; most of the complexity comes from the fact
-that GPUs actively fight three of them: allocating from a thread, making a read
-of memory actually happen, and waiting a wall-clock amount of time inside a
-kernel.
+that GPUs actively fight four of them: running a hundred kernels at once,
+allocating from inside a kernel, making a read of memory actually happen, and
+waiting a wall-clock amount of time on the device.
 
-## Launch geometry
+## One hundred named kernels
 
-100 threads in a single block of 100 (`<<<1, 100>>>`). On AMD hardware a
-wavefront is 64 lanes, so this is two wavefronts, the second one only 36/64
-occupied. That is wasteful in general, but here every thread spends 2 seconds
-waiting anyway, and keeping all 100 threads in one block keeps the mapping
-between thread index and array index trivially obvious.
+The requirement is 100 *kernels*, `rocmtestkernel_0` through
+`rocmtestkernel_99`, not one kernel launched 100 times. Each is a real entry
+point with its own symbol in the binary, launched `<<<1, 1>>>` so the GPU thread
+count still comes out at 100.
 
-The alternative, `<<<100, 1>>>`, would scatter the threads across compute units
-and is a one-line change (`kBlockSize = 1`). It does not change the results.
+Writing them out by hand would be 100 near-identical function bodies, so they are
+generated from one list of sequence numbers:
 
-## Per-thread allocation from the device heap
+```cpp
+#define ROCM_TEST_KERNEL_SEQUENCE(X) X(0) X(1) ... X(99)
+```
+
+That list is expanded three times with different `X` macros: once to define the
+kernels, once to emit the launch statements, and once to count itself into
+`kNumKernels` (`X(N)` expanding to `+1`). A `static_assert` checks the count
+against `kExpectedKernels`, so a mis-edited list fails at compile time rather
+than silently leaving array slots untouched.
+
+Token pasting is why the list has to be spelled out rather than looped: `##`
+needs a literal number to build `rocmtestkernel_42`.
+
+The launch macro expands to literal statements naming each kernel:
+
+```cpp
+rocmtestkernel_42<<<1, 1, 0, streams[42]>>>(args);
+```
+
+The alternative — a table of kernel function pointers — would be shorter, but
+launching through a pointer-to-kernel puts the host stub in between and is easy
+to get subtly wrong. Expanding the names inline keeps the generated code exactly
+what a hand-written launch would be. All arguments are bundled into a single
+`KernelArgs` struct purely so the generated signatures and launch statements stay
+short.
+
+## Streams, and why the run is not 200 seconds
+
+Kernels on the same stream run in order, so launching all 100 on the null stream
+would serialize the 2 second delays into a 200 second run. Each kernel therefore
+gets its own stream.
+
+Streams alone are not enough. HIP multiplexes them onto a small number of
+hardware queues, four by default, and kernels sharing a queue effectively run
+back to back — which would still give roughly 100 / 4 × 2 = 50 seconds. The
+program raises `GPU_MAX_HW_QUEUES` to 16 before the first HIP call (the runtime
+reads it at initialization, and the `setenv` does not override a value you set
+yourself), and prints a note if the measured total still lands far above the
+delay.
+
+Timing uses `std::chrono` around the launches and the device synchronize, rather
+than HIP events: events belong to a stream, and there is no single stream here
+that sees the whole run.
+
+## Per-kernel allocation from the device heap
 
 `malloc()` inside a kernel allocates from a fixed-size device heap that the HIP
 runtime reserves before launch. The default heap on ROCm is small — smaller than
@@ -32,21 +75,24 @@ device allocator carries per-allocation metadata and can fragment. The call must
 happen before the first kernel launch; resizing the heap afterwards is not
 allowed.
 
-Every thread checks its `malloc` for null and writes the sentinel `-1.0` if it
+All 100 allocations are live at the same time, since the kernels overlap, so the
+heap has to cover the full 100 MiB rather than one buffer at a time.
+
+Every kernel checks its `malloc` for null and writes the sentinel `-1.0` if it
 failed, rather than faulting. The host counts those and exits non-zero.
 
 ## Filling the buffer
 
-Each thread fills its 1 MiB with words from its own generator, a small 32-bit
-mixer in the style of splitmix, seeded from `seed ^ (tid * 0x9e3779b9)`. Mixing
-the thread id in is what makes the 100 checksums differ; without it every thread
-would produce the same stream and the printed array would be 100 copies of one
-number.
+Each kernel fills its 1 MiB with words from its own generator, a small 32-bit
+mixer in the style of splitmix, seeded from `seed ^ (sequence * 0x9e3779b9)`.
+Mixing the sequence number in is what makes the 100 checksums differ; without it
+every kernel would produce the same stream and the printed array would be 100
+copies of one number.
 
 The host picks the seed from `std::random_device` unless `--seed N` is given, so
 runs vary by default but are reproducible on demand.
 
-A per-thread generator is deliberately chosen over `hiprand`: it keeps the
+A hand-rolled generator is deliberately chosen over `hiprand`: it keeps the
 program dependency-free, and the statistical quality of the data does not matter
 for a checksum demo.
 
@@ -122,8 +168,10 @@ interval so the wavefront is not hammering the counter for two seconds straight.
 It is guarded by `__HIP_DEVICE_COMPILE__` because the builtin does not exist
 during the host compilation pass.
 
-All 100 threads wait concurrently, so the kernel takes about 2 seconds total, not
-100 × 2 seconds. The host prints the measured kernel time so this is visible.
+All 100 kernels wait concurrently, so the run takes about 2 seconds total rather
+than 100 × 2 seconds — provided they really do overlap, which is what the stream
+and hardware queue handling above is for. The host prints the measured total so
+this is visible.
 
 Two seconds is long for a single kernel. On a GPU that is also driving a display,
 that is enough to trip the watchdog and get the queue preempted or the device
@@ -138,8 +186,8 @@ CPU, so the global store is the last thing the kernel does:
 
 ```cpp
 free(buffer);
-busy_wait(delay_ticks, use_wall_clock);
-checksums[tid] = checksum;
+busy_wait(args.delay_ticks, args.use_wall_clock);
+args.checksums[sequence] = checksum;
 ```
 
 The checksum lives in a register across the wait. `free()` happens before the
@@ -148,11 +196,11 @@ been computed.
 
 ## Getting the results back
 
-`hipMemcpy` after `hipDeviceSynchronize()` — a blocking copy on the null stream.
-There is no need for per-thread streams or callbacks: the kernel launch is the
-unit of work, and it is not finished until all 100 threads have stored their
-value.
+`hipMemcpy` after `hipDeviceSynchronize()` — a blocking copy on the null stream,
+and the synchronize is what guarantees all 100 streams have drained. No
+per-kernel callbacks or event waits are needed: each kernel writes its own slot
+of the output array, and the slots are disjoint, so there is nothing to
+coordinate beyond "everything has finished".
 
 The host then floors each `double` into the `int` array from step 1 and prints it
-in rows of ten. Timing uses HIP events recorded around the launch, which measure
-GPU-side time rather than host wall time.
+in rows of ten.

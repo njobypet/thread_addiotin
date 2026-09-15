@@ -3,9 +3,9 @@
 // Flow:
 //   1. main() declares an array of 100 ints.
 //   2. A kernel is launched with exactly 100 GPU threads.
-//   3. Every GPU thread malloc()s 1 MiB from the device heap and checksums the
-//      bytes that happen to be there. The buffer is deliberately never written
-//      to before it is read.
+//   3. Every GPU thread malloc()s 1 MiB from the device heap, fills it with
+//      pseudo-random words from a per-thread generator, and checksums it.
+//      --uninitialized skips the fill and checksums whatever was already there.
 //   4. Each thread busy-waits 100 ms after the checksum is computed and before
 //      the result is published to global memory.
 //   5. The host copies the 100 checksums back and floors each one into the
@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <random>
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -30,9 +32,13 @@ static constexpr int kNumThreads = 100;
 static constexpr int kBlockSize = 100;
 static constexpr int kNumBlocks = (kNumThreads + kBlockSize - 1) / kBlockSize;
 
-// Step 3: 1 MiB per thread, read back as 32-bit words.
+// Step 3: 1 MiB per thread, filled and read back as 32-bit words.
 static constexpr size_t kBytesPerThread = 1u << 20;
 static constexpr size_t kWordsPerThread = kBytesPerThread / sizeof(uint32_t);
+
+// Each word is normalized to [0, 1) before being summed, so a buffer of random
+// words checksums to roughly kWordsPerThread / 2 instead of overflowing an int.
+static constexpr double kWordScale = 4294967296.0;  // 2^32
 
 // Step 4.
 static constexpr double kDelayMilliseconds = 100.0;
@@ -76,35 +82,55 @@ __device__ inline void busy_wait(unsigned long long ticks, bool use_wall_clock) 
   }
 }
 
-__global__ void checksum_uninitialized_memory(double* __restrict__ checksums,
-                                              unsigned long long delay_ticks,
-                                              bool use_wall_clock) {
+// Small 32-bit mixing generator. Each thread runs its own, so the 100 buffers
+// hold different data and the checksums differ from one another.
+__device__ inline uint32_t next_random(uint32_t& state) {
+  state += 0x9e3779b9u;
+  uint32_t z = state;
+  z = (z ^ (z >> 16)) * 0x21f0aaadu;
+  z = (z ^ (z >> 15)) * 0x735a2d97u;
+  return z ^ (z >> 15);
+}
+
+__global__ void checksum_device_memory(double* __restrict__ checksums,
+                                       unsigned long long delay_ticks,
+                                       bool use_wall_clock,
+                                       bool initialize_memory,
+                                       uint32_t seed) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= kNumThreads) {
     return;
   }
 
-  // Step 3: 1 MiB per thread straight off the device heap, left uninitialized.
+  // Step 3: 1 MiB per thread straight off the device heap.
   void* buffer = malloc(kBytesPerThread);
   if (buffer == nullptr) {
     checksums[tid] = kAllocationFailed;
     return;
   }
 
-  // volatile keeps the compiler from discarding reads of memory it can prove
-  // was never written.
-  volatile const uint32_t* words = static_cast<volatile const uint32_t*>(buffer);
+  // volatile forces the fill and the read to actually touch memory instead of
+  // being folded together, and keeps reads of never-written memory alive in
+  // --uninitialized mode.
+  volatile uint32_t* words = static_cast<volatile uint32_t*>(buffer);
+
+  if (initialize_memory) {
+    uint32_t state = seed ^ (static_cast<uint32_t>(tid) * 0x9e3779b9u);
+    for (size_t i = 0; i < kWordsPerThread; ++i) {
+      words[i] = next_random(state);
+    }
+  }
 
   unsigned long long sum = 0;
   for (size_t i = 0; i < kWordsPerThread; ++i) {
     sum += words[i];
   }
 
-  // Mean word value. The sum of 262144 words each < 2^32 stays below 2^53, so
-  // the double holds it exactly; the division is what makes the result
-  // fractional and therefore worth flooring on the host.
-  const double checksum =
-      static_cast<double>(sum) / static_cast<double>(kWordsPerThread);
+  // Sum of the words with each one normalized to [0, 1). The raw sum of 262144
+  // words each < 2^32 stays below 2^53, so the double holds it exactly and the
+  // scaling is the only place a fractional part appears - which is what makes
+  // the host-side floor meaningful. Random data lands near 131072.
+  const double checksum = static_cast<double>(sum) / kWordScale;
 
   free(buffer);
 
@@ -179,9 +205,47 @@ void print_array(const int* values, int count) {
   }
 }
 
+struct Options {
+  bool initialize_memory = true;
+  uint32_t seed = 0;  // Filled with a random seed when not given on the command line.
+  bool seed_given = false;
+  bool valid = true;
+};
+
+Options parse_arguments(int argc, char** argv) {
+  Options options;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--uninitialized") == 0) {
+      options.initialize_memory = false;
+    } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+      options.seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
+      options.seed_given = true;
+    } else {
+      std::fprintf(stderr,
+                   "usage: %s [--uninitialized] [--seed N]\n"
+                   "  --uninitialized  checksum the device heap as-is instead "
+                   "of filling it with random words\n"
+                   "  --seed N         seed the per-thread generators for a "
+                   "reproducible run\n",
+                   argv[0]);
+      options.valid = false;
+      return options;
+    }
+  }
+  if (!options.seed_given) {
+    options.seed = static_cast<uint32_t>(std::random_device{}());
+  }
+  return options;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const Options options = parse_arguments(argc, argv);
+  if (!options.valid) {
+    return EXIT_FAILURE;
+  }
+
   // Step 1.
   int checksums[kNumThreads] = {};
 
@@ -191,9 +255,16 @@ int main() {
   hipDeviceProp_t props{};
   HIP_CHECK(hipGetDeviceProperties(&props, device));
   std::printf("Device %d: %s (%s)\n", device, props.name, props.gcnArchName);
-  std::printf("Threads: %d, per-thread allocation: %zu KiB, delay: %.0f ms\n\n",
-              kNumThreads, kBytesPerThread / 1024,
-              kDelayMilliseconds);
+  std::printf("Threads: %d, per-thread allocation: %zu KiB, delay: %.0f ms\n",
+              kNumThreads, kBytesPerThread / 1024, kDelayMilliseconds);
+  if (options.initialize_memory) {
+    std::printf("Memory: filled with random words, seed 0x%08x\n\n",
+                options.seed);
+  } else {
+    std::printf(
+        "Memory: left uninitialized (freshly faulted pages usually read back "
+        "as zeros)\n\n");
+  }
 
   // The device-side allocator has a small default heap; 100 concurrent 1 MiB
   // allocations do not fit in it. Older runtimes reject the resize, in which
@@ -226,8 +297,9 @@ int main() {
 
   // Step 2.
   HIP_CHECK(hipEventRecord(start_event));
-  checksum_uninitialized_memory<<<kNumBlocks, kBlockSize>>>(
-      d_checksums, delay_ticks, timer.use_wall_clock);
+  checksum_device_memory<<<kNumBlocks, kBlockSize>>>(
+      d_checksums, delay_ticks, timer.use_wall_clock,
+      options.initialize_memory, options.seed);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipEventRecord(stop_event));
   HIP_CHECK(hipDeviceSynchronize());

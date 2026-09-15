@@ -2,8 +2,9 @@
 
 This document explains the non-obvious parts of `src/thread_addition.hip`. The
 requirements themselves are simple; most of the complexity comes from the fact
-that GPUs actively fight three of them: allocating from a thread, reading memory
-nobody wrote, and waiting a wall-clock amount of time inside a kernel.
+that GPUs actively fight three of them: allocating from a thread, making a read
+of memory actually happen, and waiting a wall-clock amount of time inside a
+kernel.
 
 ## Launch geometry
 
@@ -34,41 +35,67 @@ allowed.
 Every thread checks its `malloc` for null and writes the sentinel `-1.0` if it
 failed, rather than faulting. The host counts those and exits non-zero.
 
-## Checksumming memory nobody initialized
+## Filling the buffer
 
-Two things want to defeat this requirement:
+Each thread fills its 1 MiB with words from its own generator, a small 32-bit
+mixer in the style of splitmix, seeded from `seed ^ (tid * 0x9e3779b9)`. Mixing
+the thread id in is what makes the 100 checksums differ; without it every thread
+would produce the same stream and the printed array would be 100 copies of one
+number.
 
-1. **The compiler.** Reading an allocation that provably has not been written is
-   undefined behaviour, and LLVM is entitled to fold the loop away to whatever
-   it likes. The buffer is therefore read through a `volatile const uint32_t*`,
-   which forces every load to actually happen.
-2. **The driver.** The GPU driver zeroes pages before handing them to a process
-   for isolation reasons. So the "garbage" is usually zeros the first time a page
-   is touched. Data from a previous allocation in the *same* process can survive,
-   which is why running the program twice, or after another GPU workload, is the
-   interesting case.
+The host picks the seed from `std::random_device` unless `--seed N` is given, so
+runs vary by default but are reproducible on demand.
 
-Neither is a bug in this program, but both are worth knowing before staring at a
-screen full of zeros.
+A per-thread generator is deliberately chosen over `hiprand`: it keeps the
+program dependency-free, and the statistical quality of the data does not matter
+for a checksum demo.
+
+## Making the reads real
+
+Reading and writing through a `volatile uint32_t*` is what keeps the loops from
+being optimized away. Without it, LLVM can see that the fill loop's stores are
+never observed by anything except the very next loop, fuse the two, and compute
+the sum without ever touching memory — which would defeat the point of
+allocating 1 MiB in the first place.
+
+The `volatile` matters even more in `--uninitialized` mode, where the reads are
+of memory that provably was never written. That is undefined behaviour, and the
+compiler would be entitled to fold the loop away entirely.
+
+## Why `--uninitialized` prints zeros
+
+The amdgpu driver scrubs VRAM pages before handing them to a process, for
+isolation reasons, and the device heap this program carves from is itself a fresh
+runtime allocation. So on the first launch in a new process there is genuinely
+nothing but zeros to find. Leftover data only survives *within* a process, across
+a free and a subsequent re-allocation. A screen full of zeros in that mode is the
+driver working correctly, not a bug in the checksum.
 
 ## Why the checksum is a `double`
 
 The requirement says the CPU rounds the value down to the nearest integer, which
-only means something if the value can be fractional. So the checksum is defined
-as the **mean 32-bit word value** over the 1 MiB region:
+only means something if the value can be fractional. The checksum is therefore
+the sum of the words with each one normalized to `[0, 1)`:
 
 ```
-checksum = (sum of 262144 uint32 words) / 262144
+checksum = (sum of 262144 uint32 words) / 2^32
 ```
 
 The sum is accumulated in a `uint64_t`, so it cannot overflow: 262144 × (2³² − 1)
 ≈ 1.13 × 10¹⁵. That is also below 2⁵³, so the conversion to `double` is exact and
-the only rounding in the whole pipeline is the host-side `floor`.
+the host-side `floor` is the only rounding in the whole pipeline.
 
-The mean can in principle reach 2³² − 1, which does not fit in an `int`, so
-`floor_to_int()` clamps to `INT_MAX`/`INT_MIN` instead of invoking undefined
-behaviour on the narrowing conversion. In practice the value is nowhere near
-that.
+The `2^32` divisor, rather than dividing by the word count to get a mean, is what
+keeps random data in range. The mean word value of a uniformly random buffer is
+about 2³¹ ≈ 2.147 × 10⁹, which sits right on top of `INT_MAX` — roughly half the
+threads would clamp and the output would be a wall of `2147483647`. Normalizing
+per word instead puts the expected value at half the word count, 131072, with a
+thread-to-thread spread of a few hundred: comfortably inside `int`, and visibly
+different per thread.
+
+The upper bound is still the word count (262144 for a buffer of all-`0xFFFFFFFF`),
+so `floor_to_int()` keeps its clamp to `INT_MAX`/`INT_MIN` rather than invoking
+undefined behaviour on the narrowing conversion. Nothing realistic gets close.
 
 ## The 100 ms delay
 

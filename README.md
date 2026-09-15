@@ -1,7 +1,7 @@
 # thread_addiotin
 
 A small AMD ROCm/HIP program that has 100 GPU threads each allocate 1 MiB from the
-device heap, fill it with pseudo-random data, checksum it, wait 100 ms, and hand
+device heap, fill it with pseudo-random data, checksum it, wait 2 seconds, and hand
 the result back to the CPU, which floors each checksum into a 100-element `int`
 array and prints it.
 
@@ -12,7 +12,7 @@ array and prints it.
 | 1 | 100-element `int` array in `main` | `int checksums[kNumThreads]` in `main()` |
 | 2 | Spawn 100 GPU threads | `checksum_device_memory<<<1, 100>>>` |
 | 3 | 1 MiB per thread, filled and checksummed | device-side `malloc(1 MiB)`, filled by a per-thread generator, summed through a `volatile` pointer |
-| 4 | 100 ms in-kernel delay after the checksum | `busy_wait()` on `wall_clock64()` before the store |
+| 4 | 2 second in-kernel delay after the checksum | `busy_wait()` on `wall_clock64()` before the store |
 | 5 | Checksum back to the CPU, floored into the array | `hipMemcpy` + `std::floor` |
 | 6 | CPU prints the array | `print_array()` after all 100 values arrive |
 
@@ -82,7 +82,7 @@ Sample output:
 
 ```
 Device 0: AMD Instinct MI300X (gfx942)
-Threads: 100, per-thread allocation: 1024 KiB, delay: 100 ms
+Threads: 100, per-thread allocation: 1024 KiB, delay: 2000 ms
 Memory: filled with random words, seed 0x5c3f1a02
 
 Checksums (floored) for 100 GPU threads:
@@ -90,7 +90,7 @@ Checksums (floored) for 100 GPU threads:
   ...
   [ 90.. 99]     131118     130972     131241     131006     131155     130889     131093     131207     130964     131130
 
-Kernel wall time: 100.41 ms (expected >= 100 ms)
+Kernel wall time: 2000.38 ms (expected >= 2000 ms)
 ```
 
 The exit code is 0 when all 100 threads got their memory, and 1 if any
@@ -136,7 +136,7 @@ Everything else is a constant at the top of `src/thread_addition.hip`:
 | `kBlockSize` | 100 | Threads per block (grid size follows) |
 | `kBytesPerThread` | 1 MiB | Device-heap allocation per thread |
 | `kWordScale` | 2³² | Divisor that normalizes each word before summing |
-| `kDelayMilliseconds` | 100 | In-kernel delay before publishing the result |
+| `kDelayMilliseconds` | 2000 | In-kernel delay before publishing the result |
 | `kDeviceHeapBytes` | 200 MiB | `hipLimitMallocHeapSize`; must cover every live allocation plus allocator overhead |
 
 ## Troubleshooting
@@ -150,9 +150,13 @@ Everything else is a constant at the top of `src/thread_addition.hip`:
 - **`hipErrorUnsupportedLimit` from `hipDeviceSetLimit`** — the runtime is too old
   to resize the device heap. Upgrade ROCm, or set `HIP_MALLOC_HEAP_SIZE` in the
   environment instead.
-- **Kernel wall time is far from 100 ms** — the GPU reported no wall clock rate
+- **Kernel wall time is far from 2000 ms** — the GPU reported no wall clock rate
   and the program fell back to the shader clock (it warns when this happens).
   The shader clock drifts with DVFS, so the delay becomes approximate.
+- **The GPU resets, or the run dies with `HSA_STATUS_ERROR` / a queue preemption
+  error** — a 2 second kernel is long enough to trip the watchdog on a
+  display-attached GPU. Run on a headless device (`HIP_VISIBLE_DEVICES`), or
+  lower `kDelayMilliseconds`.
 - **`no kernel image is available for execution`** — the binary was built for a
   different architecture. Rebuild with `--offload-arch`/`CMAKE_HIP_ARCHITECTURES`
   matching `rocminfo`.

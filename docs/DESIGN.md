@@ -10,7 +10,7 @@ kernel.
 
 100 threads in a single block of 100 (`<<<1, 100>>>`). On AMD hardware a
 wavefront is 64 lanes, so this is two wavefronts, the second one only 36/64
-occupied. That is wasteful in general, but here every thread spends 100 ms
+occupied. That is wasteful in general, but here every thread spends 2 seconds
 waiting anyway, and keeping all 100 threads in one block keeps the mapping
 between thread index and array index trivially obvious.
 
@@ -97,7 +97,7 @@ The upper bound is still the word count (262144 for a buffer of all-`0xFFFFFFFF`
 so `floor_to_int()` keeps its clamp to `INT_MAX`/`INT_MIN` rather than invoking
 undefined behaviour on the narrowing conversion. Nothing realistic gets close.
 
-## The 100 ms delay
+## The 2 second delay
 
 `s_sleep` only supports short, fixed sleeps, so the delay is a busy-wait on a
 hardware counter:
@@ -118,12 +118,18 @@ approximate — the program prints a warning when it takes that path. If neither
 rate is available it assumes 100 MHz and warns again.
 
 The `__builtin_amdgcn_s_sleep(64)` in the loop body parks the SIMD for a short
-interval so the wavefront is not hammering the counter for 100 ms straight. It
-is guarded by `__HIP_DEVICE_COMPILE__` because the builtin does not exist during
-the host compilation pass.
+interval so the wavefront is not hammering the counter for two seconds straight.
+It is guarded by `__HIP_DEVICE_COMPILE__` because the builtin does not exist
+during the host compilation pass.
 
-All 100 threads wait concurrently, so the kernel takes about 100 ms total, not
-100 × 100 ms. The host prints the measured kernel time so this is visible.
+All 100 threads wait concurrently, so the kernel takes about 2 seconds total, not
+100 × 2 seconds. The host prints the measured kernel time so this is visible.
+
+Two seconds is long for a single kernel. On a GPU that is also driving a display,
+that is enough to trip the watchdog and get the queue preempted or the device
+reset; the README lists the symptoms. Headless compute cards (MI-series) have no
+such limit. The tick count is nowhere near overflowing — two seconds at 100 MHz
+is 2 × 10⁸ ticks in a 64-bit counter.
 
 ## Publishing the result after the delay
 

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(thread_addiotin
         VERSION 1.0.0
-        DESCRIPTION "Per-thread device-heap checksum with an in-kernel 100 ms delay"
+        DESCRIPTION "Per-thread device-heap checksum with an in-kernel 2 second delay"
         LANGUAGES CXX HIP)
 
 # ROCm normally lives in /opt/rocm; let the user override with -DROCM_PATH=...

@@ -1,4 +1,4 @@
-// thread_addiotin - per-thread device-heap checksum with a 100 ms in-kernel delay.
+// thread_addiotin - per-thread device-heap checksum with a 2 s in-kernel delay.
 //
 // Flow:
 //   1. main() declares an array of 100 ints.
@@ -6,7 +6,7 @@
 //   3. Every GPU thread malloc()s 1 MiB from the device heap, fills it with
 //      pseudo-random words from a per-thread generator, and checksums it.
 //      --uninitialized skips the fill and checksums whatever was already there.
-//   4. Each thread busy-waits 100 ms after the checksum is computed and before
+//   4. Each thread busy-waits 2 seconds after the checksum is computed and before
 //      the result is published to global memory.
 //   5. The host copies the 100 checksums back and floors each one into the
 //      int array from step 1.
@@ -41,7 +41,7 @@ static constexpr size_t kWordsPerThread = kBytesPerThread / sizeof(uint32_t);
 static constexpr double kWordScale = 4294967296.0;  // 2^32
 
 // Step 4.
-static constexpr double kDelayMilliseconds = 100.0;
+static constexpr double kDelayMilliseconds = 2000.0;
 
 // Device heap must hold every live allocation at once, plus allocator overhead.
 static constexpr size_t kDeviceHeapBytes =
